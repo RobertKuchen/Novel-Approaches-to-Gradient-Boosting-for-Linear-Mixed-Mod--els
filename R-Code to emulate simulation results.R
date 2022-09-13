@@ -1,0 +1,2462 @@
+
+# Before starting the simulation, one has to load/install the following
+# packages
+
+library(MASS)
+library(Matrix)
+
+
+if(!require("lme4")){install.packages("lme4")}
+
+if(!require("nlme")){install.packages("nlme")}
+
+if(!require("dplyr")){install.packages("dplyr")}
+
+if(!require("SimMultiCorrData")){install.packages("SimMultiCorrData")}
+
+
+
+
+# and assign the three boosting function and the pertaining cross-
+# validation function to their respective objects
+
+
+grbLMM <- function(y, X, Z, id, m.stop = m.stop_grbLMM, ny = 0.1, 
+                   ny2 = 0.1,  cv.dat = NULL, aic = FALSE,
+                   grbLMM_star = TRUE){
+  
+  {
+    getV <- function(x){solve(x/sigma2 + Qi)}
+    
+    getQ <- function(x, y){x + tcrossprod(as.numeric(y))}
+    
+    cfc <- function(x)(length(unique(x)))
+    
+    getZ2D <- function(x){chol2inv(chol(x + D))}
+    
+    ### basic definitions
+    
+    id <- as.numeric(factor(id, levels = unique(id)))
+    
+    # Number of Long Obs
+    
+    N <- length(id)
+    
+    # Number of Indivds
+    
+    n <- length(unique(id))
+    
+    
+    # Anzahl der Obs pro Individuum
+    
+    id.t <- as.numeric(table(id))
+    
+    
+    # Welches ist die erste Obs eines jeden Individs
+    
+    first <- rep(FALSE, N)
+    
+    for(i in 1:N){
+      
+      first[which.max(id == i)] = TRUE
+      
+    }
+    
+    # Number of Fixed-Effect- Covariates
+    
+    p <- ncol(X)
+    
+    # Number of Random Effects
+    
+    q <- ncol(Z)
+    
+    ### extract cluster-constant covariates
+    
+    ccc <- rep(FALSE, p)
+    
+    for(r in 1:p){
+      
+      if(Reduce('+', lapply(split(X[,r], id), FUN = cfc)) == n){ccc[r] = TRUE}
+    }
+    
+    
+    
+    Xcc <- cbind(1, X[first, ccc])
+    
+    
+    Xcor <- list()
+    
+    
+    # C_s
+    
+    Xcor[[1]] <- Xcc%*%solve(crossprod(Xcc))%*%t(Xcc)
+    
+    
+    if(q > 1){
+      
+      for(s in 2:q){
+        
+        x <- matrix(rep(1, n), n, 1)
+        
+        Xcor[[s]] <- x%*%solve(crossprod(x))%*%t(x)
+        
+      }
+    }
+    
+    
+    
+    # S. 16
+    
+    p1 <- rep(seq(1, q*n, q), q) + rep(0:(q-1), each = n)
+    
+    p2 <- rep(seq(1, q*n, n), n) + rep(0:(n-1), each = q)
+    
+    
+    
+    # P^{-1} 
+    
+    P1 <- sparseMatrix(seq_along(p1), p1)
+    
+    # P
+    
+    P2 <- sparseMatrix(i = seq_along(p2), j = p2)
+    
+    # C_{Schlange}
+    
+    Xcor <- bdiag(Xcor)
+    
+    Xcor <- P2%*%(diag(n*q) - Xcor)%*%P1
+    
+    ### construct random effects design matrix
+    
+    
+    
+    
+    Z0 <- Z
+    
+    Z <- Z2 <- VAR_BLUP <- list()
+    
+    for(i in 1:n){
+      
+      if(id.t[i] == 1){
+        
+        Z[[i]] = matrix(Z0[id==i,], 1, q)
+        
+      }else{
+        
+        Z[[i]] = Z0[id == i,]
+        
+      }
+      
+      Z2[[i]] = crossprod(Z[[i]])
+      
+    }
+    
+    bZ <- Z
+    
+    
+    
+    
+    # Blockdiagonal Designmatrix der Random Effects
+    
+    Z <- bdiag(Z)
+    
+    
+    
+    Z22 <- crossprod(Z)
+    
+    ##### set starting values
+    
+    beta <- rep(0, p)
+    
+    ### offset model for intercept and random structure
+    
+    if(q==1){
+      
+      offset = lme(y ~ 1, random = ~ 1 | id, control = lmeControl(opt = "optim", singular.ok = TRUE, returnObject = TRUE))
+      
+    }else{
+      
+      offset = lme(y ~ 1, random = ~ Z0[,-1] | id, control = lmeControl(opt = "optim", singular.ok = TRUE, returnObject = TRUE))
+      
+    }
+    
+    ### extract starting values
+    
+    if(grbLMM_star){
+      
+      int <- mean(y)
+      
+      gamma <- rep(0, n * q)
+      
+      sigma2 <- var(y - int)
+      
+      # Q <- Reduce("+", lapply(lapply(Z2, function(x)x/sigma2 + 0.1), solve))/n
+      
+      Q <- getVarCov(offset)
+      
+    }else{
+      
+      int <- offset$coefficients$fixed[1]
+      
+      # gamma <- Xcor%*%as.numeric(t(offset$coefficients$random$id))
+      
+      
+      gamma <- as.numeric(t(offset$coefficients$random$id))
+      
+      Q <- getVarCov(offset)
+      
+      sigma2 <- sigma(offset)^2
+      
+    }
+    
+    ### construct initial hat matrix
+    
+    C <- cbind(1, Z)
+    
+    # Diagonalmatrix mit den Random-Effects-Varianzen
+    
+    G <- kronecker(diag(n), Q)
+    
+    
+    
+    B <- as.matrix(bdiag(diag(1), solve(G)))
+    
+    
+    S <- list(C%*%bdiag(1,Xcor)%*%solve(crossprod(C) + sigma2*B)%*%t(C))
+    
+    ### in case of cv
+    
+    clcv <- NA
+    
+    if(!is.null(cv.dat)){
+      idcv = as.numeric(factor(cv.dat$idcv), levels = unique(cv.dat$idcv))
+      Ncv = length(idcv)
+      ncv = length(unique(idcv))
+      idcv.t = as.numeric(table(idcv))
+      
+      Zcv = list()
+      for(i in 1:ncv){
+        if(idcv.t[i] == 1){
+          z = cv.dat$Zcv[idcv==i,]
+          Zcv[[i]] = t(as.matrix(z, 1, q))
+        }else{
+          Zcv[[i]] = cv.dat$Zcv[idcv==i,]
+        }
+      }
+      
+      Zcv = as.matrix(bdiag(Zcv))
+    }
+    
+    ### prepare baselearners
+    
+    BL = HM = list()
+    
+    for(r in 1:p){
+      
+      x = cbind(1, X[,r])
+      
+      # Baselearner
+      
+      BL[[r]] = solve(crossprod(x))%*%t(x)
+      
+      # Hat Matrix
+      
+      HM[[r]] = ny*x%*%BL[[r]]
+    }
+    
+    
+    
+    
+    ### define storing matrices/vectors
+    
+    INT <- int
+    
+    BETA <- beta
+    
+    GAMMA <- gamma
+    
+    SIGMA2 <- sigma2
+    
+    CLCV = l = AIC = AICc = c()
+    
+  }
+  
+  
+  for(m in 1:m.stop){
+    ###############################################################
+    #### S1 #######################################################
+    ###############################################################
+    eta <- as.vector(int + X%*%beta + Z%*%gamma)
+    
+    u  <- y - eta
+    
+    fits <- matrix(0, 3, p)
+    
+    for(r in 1:p){
+      
+      # Beta (Koeffizientenvektor Fixed Effects)
+      
+      fit = BL[[r]]%*%u
+      
+      fits[1,r] = fit[1]
+      
+      fits[2,r] = fit[2]
+      
+      fits[3,r] = sum((u - cbind(1, X[,r])%*%fit)^2)
+    }
+    
+    best <- which.min(fits[3,])
+    
+    int <- int + ny*fits[1,best]
+    
+    beta[best] <- beta[best] + ny*fits[2,best]
+    
+    
+    ###############################################################
+    #### S2 #######################################################
+    ###############################################################
+    
+    eta <- as.vector(int + X%*%beta + Z%*%gamma)
+    
+    u <- y - eta
+    
+    D <- solve(Q/sigma2)
+    
+    Z2D <- lapply(Z2, getZ2D)
+    
+    rfit <- Xcor%*%bdiag(Z2D)%*%t(Z)
+    
+    gamma <- gamma + ny2 * rfit%*%u
+    
+    ###############################################################
+    #### S3 #######################################################
+    ###############################################################
+    eta = as.vector(int + X%*%beta + Z%*%gamma)
+    
+    Qi = solve(Q)
+    
+    getV <- function(x){solve(x/sigma2 + Qi)}
+    
+    sigma2 = var(y - eta)
+    
+    V = lapply(Z2, getV)
+    
+    V = mapply(FUN = getQ, V, split(gamma, rep(1:n, each = q)), SIMPLIFY = FALSE)
+    
+    Q = Reduce("+", V)/n
+    
+    ### predictive risk computation
+    
+    if(!is.null(cv.dat)){
+      # Qcv = diag(Ncv) + Zcv%*%kronecker(diag(ncv), Q/sigma2)%*%t(Zcv)
+      clcv <- mean((cv.dat$ycv - int - cv.dat$Xcv%*%beta)^2)
+    }
+    
+    if(aic){
+      
+      Sma = HM[[best]]
+      
+      Smb = Z%*%rfit
+      
+      S[[m+1]] = diag(N) - (diag(N) - Smb)%*%(diag(N) - Sma)%*%(diag(N) - S[[m]])
+      
+      df = sum(diag(S[[m+1]]))
+      
+      s2 = mean((y - eta)^2)
+      
+      AICc[m] = log(s2) + (1 + df/N) / (1 - (df + 2)/N)
+    }
+    
+    INT <- c(INT, int)
+    
+    BETA <- rbind(BETA, beta)
+    
+    GAMMA <- cbind(GAMMA, gamma)
+    
+    SIGMA2 <- c(SIGMA2, sigma2)
+    
+    VAR_BLUP[[m]] <- Q
+    
+    CLCV <- c(CLCV, clcv)
+    
+    if(m%%10 == 0){print(m)}
+  }
+  
+  structure(list(int = int, beta = beta, sigma2 = sigma2, gamma = gamma, Q = Q, 
+                 INT = INT, BETA = BETA, SIGMA2 = SIGMA2, GAMMA = t(GAMMA), VAR_BLUP = VAR_BLUP,
+                 S = S, eta = eta, CLCV = CLCV))
+}
+
+agrbLMM <- function(y, X, Z, id, m.stop = m.stop_agrbLMM, 
+                    ny = 0.1, cv.dat = NULL, aic = FALSE){
+  
+  {
+    
+    cfc <- function(x)(length(unique(x)))
+    
+    ### basic definitions
+    
+    id <- as.numeric(factor(id, levels = unique(id)))
+    
+    # Number of Long Obs
+    
+    N <- length(id)
+    
+    # Number of Indivds
+    
+    n <- length(unique(id))
+    
+    # Anzahl der Obs pro Individuum
+    
+    id.t <- as.numeric(table(id))
+    
+    # Welches ist die erste Obs eines jeden Individs
+    
+    first <- rep(FALSE, N)
+    
+    for(i in 1:N){
+      
+      first[which.max(id == i)] = TRUE
+      
+    }
+    
+    # Number of Fixed-Effect- Covariates
+    
+    p <- ncol(X)
+    
+    # Number of Random Effects
+    
+    q <- ncol(Z)
+    
+    ### extract cluster-constant covariates
+    
+    ccc <- rep(FALSE, p)
+    
+    for(r in 1:p){
+      
+      if(Reduce('+', lapply(split(X[,r], id), FUN = cfc)) == n){ccc[r] = TRUE}
+    }
+    
+    
+    Xcc <- cbind(1, X[first, ccc])
+    
+    # Xsw = X[,ccc]
+    
+    Xcor <- list()
+    
+    
+    Xcor[[1]] <- Xcc%*%solve(crossprod(Xcc))%*%t(Xcc)
+    
+    
+    if(q > 1){
+      
+      for(s in 2:q){
+        
+        x <- matrix(rep(1, n), n, 1)
+        
+        Xcor[[s]] <- x%*%solve(crossprod(x))%*%t(x)
+        
+      }
+    }
+    
+    
+    # S. 16
+    
+    p1 <- rep(seq(1, q*n, q), q) + rep(0:(q-1), each = n)
+    
+    p2 <- rep(seq(1, q*n, n), n) + rep(0:(n-1), each = q)
+    
+    
+    # P^{-1} 
+    
+    P1 <- sparseMatrix(seq_along(p1), p1)
+    
+    # P
+    
+    P2 <- sparseMatrix(i = seq_along(p2), j = p2)
+    
+    # C_{Schlange}
+    
+    Xcor <- bdiag(Xcor)
+    
+    Xcor <- P2%*%(diag(n*q) - Xcor)%*%P1
+    
+    ### construct random effects design matrix
+    
+    Z0 <- Z
+    
+    Z <- list()
+    
+    for(i in 1:n){
+      
+      if(id.t[i] == 1){
+        
+        Z[[i]] = matrix(Z0[id==i,], 1, q)
+        
+      }else{
+        
+        Z[[i]] = Z0[id == i,]
+        
+      }
+    }
+    
+    bZ <- Z
+    
+    # Blockdiagonal Designmatrix der Random Effects
+    
+    Z <- bdiag(Z)
+    
+    ##### set starting values
+    
+    beta <- rep(0, p)
+    
+    ### offset model for intercept and random structure
+    
+    ### extract starting values
+    
+    int <- mean(y)
+    
+    gamma <- rep(0, 2 * length(unique(id)))
+    
+    sigma2 <- var(y)
+    
+    ### in case of cv
+    
+    clcv <- NA
+    
+    if(!is.null(cv.dat)){
+      idcv = as.numeric(factor(cv.dat$idcv), levels = unique(cv.dat$idcv))
+      Ncv = length(idcv)
+      ncv = length(unique(idcv))
+      idcv.t = as.numeric(table(idcv))
+      
+      Zcv = list()
+      for(i in 1:ncv){
+        if(idcv.t[i] == 1){
+          z = cv.dat$Zcv[idcv==i,]
+          Zcv[[i]] = t(as.matrix(z, 1, q))
+        }else{
+          Zcv[[i]] = cv.dat$Zcv[idcv==i,]
+        }
+      }
+      
+      Zcv = as.matrix(bdiag(Zcv))
+    }
+    
+    ### prepare baselearners
+    
+    BL = list()
+    
+    for(r in 1:p){
+      
+      x = cbind(1, X[,r])
+      
+      BL[[r]] = solve(crossprod(x))%*%t(x)
+    }
+    
+    ### define storing matrices/vectors
+    
+    INT <- int
+    
+    BETA <- beta
+    
+    GAMMA <- gamma
+    
+    SIGMA2 <- 0
+    
+    CLCV = l = AIC = AICc = c()
+    
+    VAR_BLUP <- vector("list", m.stop)
+    
+    m <- 1
+    
+  }
+  
+  for(m in 1:m.stop){
+    ###############################################################
+    #### S1 #######################################################
+    ###############################################################
+    
+    eta <- as.vector(int + X%*%beta + Z%*%gamma)
+    
+    u  <- y - eta
+    
+    fits <- matrix(0, 3, p)
+    
+    for(r in 1:p){
+      
+      # Beta (Koeffizientenvektor Fixed Effects)
+      
+      fit = BL[[r]]%*%u
+      
+      fits[1,r] = fit[1]
+      
+      fits[2,r] = fit[2]
+      
+      fits[3,r] = sum((u - cbind(1, X[,r])%*%fit)^2)
+    }
+    
+    best <- which.min(fits[3,])
+    
+    int <- int + ny*fits[1,best]
+    
+    beta[best] <- beta[best] + ny*fits[2,best]
+    
+    
+    eta <- as.vector(int + X%*%beta)
+    
+    u  <- y - eta 
+    
+    if(m < m.stop){
+      
+      data_0 <- data.frame(u, id = id, xij_1 = X[,colnames(X) == "xij_1"])
+      
+      lmer_0 <- lmer(formula = u ~ 1 + (xij_1|id), data = data_0, REML = FALSE)
+      
+    }else{
+      
+      data_0 <- data.frame(y, id = id, X[,beta != 0])
+      
+      lmer_0 <- lmer(formula = y ~ . - id  + (xij_1|id), data = data_0, REML = TRUE)
+      
+    }
+    
+    gamma <- Xcor%*%as.numeric(t(ranef(lmer_0)$id))
+    
+    sigma2 <- sigma(lmer_0)^2
+    
+    # CV
+    
+    if(!is.null(cv.dat)){
+      
+      clcv <- mean((cv.dat$ycv - int - cv.dat$Xcv%*%beta)^2)
+    }
+    
+    INT <- c(INT, int)
+    
+    BETA <- rbind(BETA, beta)
+    
+    GAMMA <- cbind(GAMMA, gamma)
+    
+    SIGMA2 <- c(SIGMA2, sigma2)
+    
+    CLCV <- c(CLCV, clcv)
+    
+    
+    VAR_BLUP[[m]] <- unname(bdiag(VarCorr(lmer_0)))
+    
+    if(m%%10 == 0){print(m)}
+    
+  }
+  
+  
+  structure(list(int = int, beta = beta, sigma2 = sigma2, gamma = gamma, 
+                 INT = INT, BETA = BETA, SIGMA2 = SIGMA2, GAMMA = t(GAMMA),
+                 eta = eta, VAR_BLUP = VAR_BLUP, CLCV = CLCV))
+}
+
+
+kgrbLMM <- function(y, X, Z, id, m.stop = m.stop_agrbLMM,
+                    ny = 0.1, cv.dat = NULL, aic = FALSE){
+  
+  {
+    
+    cfc <- function(x)(length(unique(x)))
+    
+    ### basic definitions
+    
+    id <- as.numeric(factor(id, levels = unique(id)))
+    
+    # Number of Long Obs
+    
+    N <- length(id)
+    
+    # Number of Indivds
+    
+    n <- length(unique(id))
+    
+    # Anzahl der Obs pro Individuum
+    
+    id.t <- as.numeric(table(id))
+    
+    # Welches ist die erste Obs eines jeden Individs
+    
+    first <- rep(FALSE, N)
+    
+    for(i in 1:N){
+      
+      first[which.max(id == i)] = TRUE
+      
+    }
+    
+    # Number of Fixed-Effect- Covariates
+    
+    p <- ncol(X)
+    
+    # Number of Random Effects
+    
+    q <- ncol(Z)
+    
+    ### extract cluster-constant covariates
+    
+    ### construct random effects design matrix
+    
+    Z0 <- Z
+    
+    Z <- list()
+    
+    for(i in 1:n){
+      
+      if(id.t[i] == 1){
+        
+        Z[[i]] = matrix(Z0[id==i,], 1, q)
+        
+      }else{
+        
+        Z[[i]] = Z0[id == i,]
+        
+      }
+    }
+    
+    bZ <- Z
+    
+    # Blockdiagonal Designmatrix der Random Effects
+    
+    Z <- bdiag(Z)
+    
+    ##### set starting values
+    
+    beta <- rep(0, p)
+    
+    ### offset model for intercept and random structure
+    
+    ### extract starting values
+    
+    all_data <- data.frame(y, X, id)
+    
+    lmer_0 <- lmer(formula = y ~ . - id + (1 + xij_1|id), data = all_data)
+    
+    int <- mean(y)
+    
+    gamma <- as.numeric(t(ranef(lmer_0)$id))
+    
+    sigma2 <- sigma(lmer_0)^2
+    
+    ### in case of cv
+    
+    clcv <- NA
+    
+    if(!is.null(cv.dat)){
+      idcv = as.numeric(factor(cv.dat$idcv), levels = unique(cv.dat$idcv))
+      Ncv = length(idcv)
+      ncv = length(unique(idcv))
+      idcv.t = as.numeric(table(idcv))
+      
+      Zcv = list()
+      for(i in 1:ncv){
+        if(idcv.t[i] == 1){
+          z = cv.dat$Zcv[idcv==i,]
+          Zcv[[i]] = t(as.matrix(z, 1, q))
+        }else{
+          Zcv[[i]] = cv.dat$Zcv[idcv==i,]
+        }
+      }
+      
+      Zcv = as.matrix(bdiag(Zcv))
+    }
+    
+    ### prepare baselearners
+    
+    BL = list()
+    
+    for(r in 1:p){
+      
+      x = cbind(1, X[,r])
+      
+      BL[[r]] = solve(crossprod(x))%*%t(x)
+    }
+    
+    ### define storing matrices/vectors
+    
+    INT <- int
+    
+    BETA <- beta
+    
+    GAMMA <- gamma
+    
+    SIGMA2 <- sigma2
+    
+    CLCV = l = AIC = AICc = c()
+    
+    VAR_BLUP <- vector("list", 1)
+    
+    m <- 1
+    
+  }
+  
+  for(m in 1:m.stop){
+    ###############################################################
+    #### S1 #######################################################
+    ###############################################################
+    
+    eta <- as.vector(int + X%*%beta + Z%*%gamma)
+    
+    u  <- y - eta
+    
+    fits <- matrix(0, 3, p)
+    
+    for(r in 1:p){
+      
+      # Beta (Koeffizientenvektor Fixed Effects)
+      
+      fit = BL[[r]]%*%u
+      
+      fits[1,r] = fit[1]
+      
+      fits[2,r] = fit[2]
+      
+      fits[3,r] = sum((u - cbind(1, X[,r])%*%fit)^2)
+    }
+    
+    best <- which.min(fits[3,])
+    
+    int <- int + ny*fits[1,best]
+    
+    beta[best] <- beta[best] + ny*fits[2,best]
+    
+    
+    
+    if(!is.null(cv.dat)){
+      
+      clcv <- mean((cv.dat$ycv - int - cv.dat$Xcv%*%beta)^2)
+    }
+    
+    INT <- c(INT, int)
+    
+    BETA <- rbind(BETA, beta)
+    
+    GAMMA <- cbind(GAMMA, gamma)
+    
+    SIGMA2 <- c(SIGMA2, sigma2)
+    
+    CLCV <- c(CLCV, clcv)
+    
+    
+    VAR_BLUP[[m]] <- unname(bdiag(VarCorr(lmer_0)))
+    
+    if(m%%10 == 0){print(m)}
+  }
+  
+  
+  structure(list(int = int, beta = beta, sigma2 = sigma2, gamma = gamma, 
+                 INT = INT, BETA = BETA, SIGMA2 = SIGMA2, GAMMA = t(GAMMA),
+                 eta = eta, VAR_BLUP = VAR_BLUP, CLCV = CLCV))
+}
+
+
+cv.grbLMM <- function(k, y, X, Z, id, m.stop = 500, 
+                      ny = 0.1, cores = 1, ny2 = ny2, 
+                      which_model){
+  
+  id <- as.numeric(factor(id, levels = unique(id)))
+  
+  id.t <- as.numeric(table(id))
+  
+  n <- length(id.t)
+  
+  ### create an equally sized partition
+  sets <- sample(cut(1:n, k, labels = F))
+  
+  sets <- rep(sets, id.t)
+  
+  ### function for each fold
+  
+  k.fold <- function(k){
+    
+    y_train <- y[sets != k]
+    
+    X_train <- X[sets != k,]
+    
+    Z_train <- as.matrix(Z[sets != k,])
+    
+    id_train <- id[sets != k]
+    
+    cv.dat <- list('ycv' = y[sets == k],
+                   'Xcv' = X[sets == k,],
+                   'Zcv' = as.matrix(Z[sets == k,]),
+                   'idcv' = id[sets == k])
+    
+    if(which_model == "grbLMM"){
+      
+      model <- grbLMM(y_train, X_train, Z_train, id_train, m.stop = m.stop, ny = .1, cv.dat = cv.dat,
+                      grbLMM_star = grbLMM_star, ny2 = ny2)
+      
+    }else{
+      
+      if(which_model == "agrbLMM"){
+        
+        model <- agrbLMM(y_train, X_train, Z_train, id_train, m.stop = m.stop, ny = .1, cv.dat = cv.dat)
+        
+      }else{
+        
+        if(which_model == "kgrbLMM"){
+          
+          model <- kgrbLMM(y_train, X_train, Z_train, id_train, m.stop = m.stop, ny = .1, cv.dat = cv.dat)
+          
+        }else{
+          
+          stop("No valid model type")
+        }
+        
+      }
+      
+    }
+    
+    return(model$CLCV)
+    
+  }
+  
+  ### execute model on all folds
+  if(cores==1){
+    cv.ls <- lapply(1:k, k.fold)
+  }else{
+    cv.ls <- mclapply(1:k, k.fold, mc.cores = cores)
+  }
+  
+  ### find best performing m.stop averaged over all folds
+  cv.MAT <- c()
+  
+  for(i in 1:k){
+    cv.MAT <- rbind(cv.MAT, cv.ls[[i]])
+  }
+  
+  pred.risk <- colMeans(cv.MAT)
+  
+  m.opt <- which.min(pred.risk)
+  
+  if(which_model == "grbLMM"){
+    
+    model <- grbLMM(y, X, Z, id, m.stop = m.opt, grbLMM_star = grbLMM_star, ny2 = ny2)
+    
+  }else{
+    
+    if(which_model == "agrbLMM"){
+      
+      model <- agrbLMM(y, X, Z, id, m.stop = m.opt)
+      
+    }else{
+      
+      if(which_model == "kgrbLMM"){
+        
+        model <- kgrbLMM(y, X, Z, id, m.stop = m.opt)
+        
+      }
+    }
+  }
+  
+  model$m.opt <- m.opt
+  model$pred <- pred.risk
+  model$coef <- c(model$int, model$beta)
+  model$folds <- cv.MAT
+  
+  return(model)
+}
+
+
+# Table 1 ----------------------------------------------------------------
+
+# To obtain the results of Table 1, the main loop (at the very bottom) has
+# to be run with the following settings:
+
+
+set.seed(1111)
+
+n_iter <- 100
+
+start_value <- 1
+
+iter_from <- 1
+
+iter_to <- 100
+
+incl_lists <- c(TRUE, FALSE)[2]
+
+imbalanced <- FALSE
+
+
+incl_con_unin <- FALSE
+
+incl_bin_unin <- FALSE
+
+incl_td_con_unin <- FALSE
+
+incl_td_bin_unin <- FALSE
+
+
+grbLMM_star <- FALSE
+
+grbLMM <- TRUE
+
+agrbLMM <- FALSE
+
+kgrbLMM <- FALSE
+
+fit_lme <- FALSE
+
+ny2 <- 0.1
+
+incl_ran_sl <- c(TRUE, FALSE)[1]
+
+
+cv <- TRUE
+
+k <- 5
+
+m.stop_grbLMM <- 1000
+
+
+
+coef_intercept <- 50 # Intercept
+
+coef_fixed_I <- 10 # continuous time-Dependent-FixefRanef variable
+
+coef_fixed_II <- 0 # Time-fixed continuous variable
+
+coef_fixed_III <- 0 # Time-dependent continuous variable
+
+coef_fixed_IV <- 10 # Time-fixed binary variable
+
+coef_fixed_V <- 0 # Time-dependent binary variable
+
+
+tau2 <- 36
+
+sigma2 <- 25
+
+varU1j <- 4
+
+covU0jU1j <- 0.25
+
+
+
+est_grbLMM <- matrix(0, nrow = n_iter, ncol = 13)
+
+
+colnames(est_grbLMM) <- c("(Intercept)", 
+                          "Beta_1", "Beta_2", 
+                          "Sigma_Squa", "Tau_0_Squa",
+                           "Var_Ran_Int", "Tau_1_Squa", 
+                           "Var_Ran_Slo", "Tau_0_1", 
+                           "Cov_Ran_Eff", "Number_Iter", 
+                           "SSPE", "N_obs_Test")
+
+
+# RUN THE MAIN LOOP (at the very bottom)
+
+
+# After the loop has finished, the mean of the estimated parameters
+# and the mean squared error (MSE) can be calculated by the following
+# commands:
+
+
+apply(est_grbLMM, 2, mean)
+
+
+matrix(apply((est_grbLMM[,c(1:5, 7)] - 
+                matrix(rep(c(50,10,10,25,36,4), 100),
+                       byrow = TRUE, nrow = 100))^2, 2, mean), nrow = 1)
+
+# Table 2 ----------------------------------------------------------------
+
+# To obtain the results of Table 1, based on the same settings that 
+# was used to obtain the results of Table 1 (the code above), one has to set:
+
+imbalanced <- TRUE
+
+
+
+# RUN THE MAIN LOOP (at the very bottom)
+
+
+# After the loop has finished, the mean of the estimated parameters
+# and the mean squared error (MSE) can be calculated by the following
+# commands:
+
+apply(est_grbLMM, 2, mean)
+
+
+matrix(apply((est_grbLMM[,c(1:5, 7)] - 
+                matrix(rep(c(50,10,10,25,36,4), 100),
+                       byrow = TRUE, nrow = 100))^2, 2, mean), nrow = 1)
+
+# Table 3 ----------------------------------------------------------------
+
+# To obtain the results of Table 3, based on the same settings that 
+# was used to obtain the results of Table 2 (all the code above), one has to set:
+
+grbLMM_star <- TRUE
+
+ny2 <- 0.01
+
+# RUN THE MAIN LOOP (at the very bottom)
+
+
+
+# After the loop has finished, the mean of the estimated parameters
+# and the mean squared error (MSE) can be calculated by the following
+# commands:
+
+apply(est_grbLMM, 2, mean)
+
+
+matrix(apply((est_grbLMM[,c(1:5, 7)] - 
+                matrix(rep(c(50,10,10,25,36,4), 100),
+                       byrow = TRUE, nrow = 100))^2, 2, mean), nrow = 1)
+
+# Table 4 ----------------------------------------------------------------
+
+# To obtain the results of Table 4, based on the same settings that 
+# was used to obtain the results of Table 3 (all the code above), one has to set:
+
+ny2 <- 0.001
+
+
+
+# RUN THE MAIN LOOP (at the very bottom)
+
+
+
+# After the loop has finished, the mean of the estimated parameters
+# and the mean squared error (MSE) can be calculated by the following
+# commands:
+
+apply(est_grbLMM, 2, mean)
+
+
+matrix(apply((est_grbLMM[,c(1:5, 7)] - 
+                matrix(rep(c(50,10,10,25,36,4), 100),
+                       byrow = TRUE, nrow = 100))^2, 2, mean), nrow = 1)
+
+
+
+# Simulation Model II -----------------------------------------------------
+
+# To obtain the results of Table 6, the main loop (at the very bottom) has
+# to be run with the following settings:
+
+set.seed(2222)
+
+
+
+n_iter <- 250
+
+start_value <- 1
+
+iter_from <- 1
+
+iter_to <- 250
+
+
+
+incl_lists <- c(TRUE, FALSE)[2]
+
+imbalanced <- TRUE
+
+
+incl_con_unin <- TRUE
+
+incl_bin_unin <- TRUE
+
+incl_td_con_unin <- TRUE
+
+incl_td_bin_unin <- TRUE
+
+
+no_con_unin <- 25
+
+no_bin_unin <- 25
+
+no_td_con_unin <- 25
+
+no_td_bin_unin <- 25
+
+
+grbLMM_star <- TRUE
+
+run_grbLMM <- TRUE
+
+run_agrbLMM <- TRUE
+
+run_kgrbLMM <- TRUE
+
+fit_lme <- TRUE
+
+ny2 <- 0.01
+
+incl_ran_sl <- c(TRUE, FALSE)[1]
+
+no_vec <- numeric(n_iter)
+
+
+cv <- TRUE
+
+k <- 5
+
+m.stop_grbLMM <- 350
+
+m.stop_agrbLMM <- 350
+
+m.stop_kgrbLMM <- 350
+
+
+
+coef_intercept <- 5 # Intercept
+
+coef_fixed_I <- 1 # continuous time-Dependent-FixefRanef variable
+
+coef_fixed_II <- -1 # Time-fixed continuous variable
+
+coef_fixed_III <- 1 # Time-dependent continuous variable
+
+coef_fixed_IV <- 2 # Time-fixed binary variable
+
+coef_fixed_V <- -2 # Time-dependent binary variable
+
+
+tau2 <- 36
+
+sigma2 <- 36
+
+varU1j <- 4
+
+covU0jU1j <- 1
+
+
+est_lme <- matrix(0, nrow = n_iter, ncol = 115)
+
+est_grbLMM <- matrix(0, nrow = n_iter, ncol = 116)
+
+est_agrbLMM <- matrix(0, nrow = n_iter, ncol = 116)
+  
+est_kgrbLMM <- matrix(0, nrow = n_iter, ncol = 116)
+
+
+
+names_columns <-      c("(Intercept)", "Beta_1", "Beta_2", 
+                        "Beta_3", "Beta_4", "Beta_5",
+                        c(paste0("Time_Costant_Conti_Unin_", 1:25),
+                          paste0("Time_Costant_Bin_Unin_", 1:25),
+                          paste0("Time_Depen_Conti_Unin_", 1:25),
+                          paste0("Time_Depen_Bin_Unin_", 1:25)),
+                        "Sigma_Squa", "Tau_0_Squa",
+                        "Var_Ran_Int", "Tau_1_Squa", 
+                        "Var_Ran_Slo", "Tau_0_1", 
+                        "Cov_Ran_Eff", "Number_Iter", 
+                        "SSPE", "N_obs_Test")
+
+
+colnames(est_lme) <- names_columns[-114]
+
+
+colnames(est_grbLMM) <- colnames(est_agrbLMM) <- 
+  colnames(est_kgrbLMM) <- names_columns
+
+
+
+# RUN THE MAIN LOOP (at the very bottom)
+
+
+
+# After the loop has finished, the mean and the mean squared error (MSE) 
+# of the estimated parameters (except the 100 uninformative covariates) can
+# be calculated by the following commands:
+
+apply(est_lme[,c(1:6, 107,108,110, 7)], 2, mean)
+
+apply(est_grbLMM[,c(1:6, 107,108,110, 7)], 2, mean)
+
+apply(est_agrbLMM[,c(1:6, 107,108,110, 7)], 2, mean)
+
+apply(est_kgrbLMM[,c(1:6, 107,108,110, 7)], 2, mean)
+
+
+matrix(apply((est_lme[,c(1:6, 107,108,110)] - 
+                matrix(rep(c(5,1,-1,1,2,-2,36,36,4), n_iter),
+                       byrow = TRUE, nrow = n_iter))^2, 2, mean), nrow = 1)
+
+
+matrix(apply((est_grbLMM[,c(1:6, 107,108,110)] - 
+                matrix(rep(c(5,1,-1,1,2,-2,36,36,4), n_iter),
+                       byrow = TRUE, nrow = n_iter))^2, 2, mean), nrow = 1)
+
+
+matrix(apply((est_agrbLMM[,c(1:6, 107,108,110)] - 
+                matrix(rep(c(5,1,-1,1,2,-2,36,36,4), n_iter),
+                       byrow = TRUE, nrow = n_iter))^2, 2, mean), nrow = 1)
+
+
+matrix(apply((est_kgrbLMM[,c(1:6, 107,108,110)] - 
+                matrix(rep(c(5,1,-1,1,2,-2,36,36,4), n_iter),
+                       byrow = TRUE, nrow = n_iter))^2, 2, mean), nrow = 1)
+
+
+# The mean and the MSE of all uninformative covariates over all simulation
+# rounds can be calculated by
+
+matrix(mean(matrix(apply(est_grbLMM, 2, mean)[7:106], nrow = 1)), nrow = 1)
+
+matrix(mean((est_grbLMM[,7:106] - matrix(0, nrow = n_iter, ncol = 100))^2), nrow = 1)
+
+
+
+# The true-positive and the false-positive proportions of Table 7
+# can be calculated by:
+
+sum(est_grbLMM[,1:6] != 0)/(n_iter * 6)
+
+sum(est_agrbLMM[,1:6] != 0)/(n_iter * 6)
+
+sum(est_kgrbLMM[,1:6] != 0)/(n_iter * 6)
+
+
+sum(est_grbLMM[,7:106] != 0)/(n_iter * 100)
+
+sum(est_agrbLMM[,7:106] != 0)/(n_iter * 100)
+
+sum(est_kgrbLMM[,7:106] != 0)/(n_iter * 100)
+
+
+# The Mean squared predictions errors in Table 7 can be calculated by:
+
+mean(est_lme[,114]/est_grbLMM[,115])
+
+mean(est_grbLMM[,115]/est_grbLMM[,116])
+
+mean(est_agrbLMM[,115]/est_agrbLMM[,116])
+
+mean(est_kgrbLMM[,115]/est_kgrbLMM[,116])
+
+
+# The mean stopping iteration numbers in Table 7 can be calculated by:
+
+mean(est_grbLMM[,114])
+
+mean(est_agrbLMM[,114])
+
+mean(est_kgrbLMM[,114])
+
+
+
+
+
+
+# Simulation Study III -----------------------------------------------------
+
+set.seed(2222)
+
+
+
+n_iter <- 250
+
+start_value <- 1
+
+iter_from <- 1
+
+iter_to <- 250
+
+
+
+incl_lists <- c(TRUE, FALSE)[2]
+
+imbalanced <- TRUE
+
+
+incl_con_unin <- TRUE
+
+incl_bin_unin <- TRUE
+
+incl_td_con_unin <- TRUE
+
+incl_td_bin_unin <- TRUE
+
+
+no_con_unin <- 25
+
+no_bin_unin <- 25
+
+no_td_con_unin <- 25
+
+no_td_bin_unin <- 25
+
+
+grbLMM_star <- TRUE
+
+run_grbLMM <- TRUE
+
+run_agrbLMM <- TRUE
+
+run_kgrbLMM <- TRUE
+
+fit_lme <- TRUE
+
+ny2 <- 0.01
+
+incl_ran_sl <- c(TRUE, FALSE)[1]
+
+no_vec <- numeric(n_iter)
+
+
+cv <- TRUE
+
+k <- 5
+
+m.stop_grbLMM <- 600
+
+m.stop_agrbLMM <- 600
+
+m.stop_kgrbLMM <- 600
+
+
+
+coef_intercept <- 5 # Intercept
+
+coef_fixed_I <- 1 # continuous time-Dependent-FixefRanef variable
+
+coef_fixed_II <- -1 # Time-fixed continuous variable
+
+coef_fixed_III <- 1 # Time-dependent continuous variable
+
+coef_fixed_IV <- 2 # Time-fixed binary variable
+
+coef_fixed_V <- -2 # Time-dependent binary variable
+
+
+tau2 <- 4
+
+sigma2 <- 4
+
+varU1j <- 1
+
+covU0jU1j <- 0.25
+
+
+est_lme <- matrix(0, nrow = n_iter, ncol = 115)
+
+est_grbLMM <- matrix(0, nrow = n_iter, ncol = 116)
+
+est_agrbLMM <- matrix(0, nrow = n_iter, ncol = 116)
+
+est_kgrbLMM <- matrix(0, nrow = n_iter, ncol = 116)
+
+
+
+names_columns <-      c("(Intercept)", "Beta_1", "Beta_2", 
+                        "Beta_3", "Beta_4", "Beta_5",
+                        c(paste0("Time_Costant_Conti_Unin_", 1:25),
+                          paste0("Time_Costant_Bin_Unin_", 1:25),
+                          paste0("Time_Depen_Conti_Unin_", 1:25),
+                          paste0("Time_Depen_Bin_Unin_", 1:25)),
+                        "Sigma_Squa", "Tau_0_Squa",
+                        "Var_Ran_Int", "Tau_1_Squa", 
+                        "Var_Ran_Slo", "Tau_0_1", 
+                        "Cov_Ran_Eff", "Number_Iter", 
+                        "SSPE", "N_obs_Test")
+
+
+colnames(est_lme) <- names_columns[-114]
+
+
+colnames(est_grbLMM) <- colnames(est_agrbLMM) <- 
+  colnames(est_kgrbLMM) <- names_columns
+
+
+
+
+# RUN THE MAIN LOOP (at the very bottom)
+
+
+
+# After the loop has finished, the mean and the mean squared error (MSE) 
+# of the estimated parameters (except the 100 uninformative covariates) can
+# be calculated by the following commands:
+
+apply(est_lme[,c(1:6, 107,108,110, 7)], 2, mean)
+
+apply(est_grbLMM[,c(1:6, 107,108,110, 7)], 2, mean)
+
+apply(est_agrbLMM[,c(1:6, 107,108,110, 7)], 2, mean)
+
+apply(est_kgrbLMM[,c(1:6, 107,108,110, 7)], 2, mean)
+
+
+matrix(apply((est_lme[,c(1:6, 107,108,110)] - 
+                matrix(rep(c(5,1,-1,1,2,-2,4,4,1), n_iter),
+                       byrow = TRUE, nrow = n_iter))^2, 2, mean), nrow = 1)
+
+
+matrix(apply((est_grbLMM[,c(1:6, 107,108,110)] - 
+                matrix(rep(c(5,1,-1,1,2,-2,4,4,1), n_iter),
+                       byrow = TRUE, nrow = n_iter))^2, 2, mean), nrow = 1)
+
+
+matrix(apply((est_agrbLMM[,c(1:6, 107,108,110)] - 
+                matrix(rep(c(5,1,-1,1,2,-2,4,4,1), n_iter),
+                       byrow = TRUE, nrow = n_iter))^2, 2, mean), nrow = 1)
+
+
+matrix(apply((est_kgrbLMM[,c(1:6, 107,108,110)] - 
+                matrix(rep(c(5,1,-1,1,2,-2,4,4,1), n_iter),
+                       byrow = TRUE, nrow = n_iter))^2, 2, mean), nrow = 1)
+
+
+# The mean and the MSE of all uninformative covariates over all simulation
+# rounds can be calculated by
+
+matrix(mean(matrix(apply(est_grbLMM, 2, mean)[7:106], nrow = 1)), nrow = 1)
+
+matrix(mean((est_grbLMM[,7:106] - matrix(0, nrow = n_iter, ncol = 100))^2), nrow = 1)
+
+
+# The true-positive and the false-positive proportions of Table 7
+# can be calculated by:
+
+sum(est_grbLMM[,1:6] != 0)/(n_iter * 6)
+
+sum(est_agrbLMM[,1:6] != 0)/(n_iter * 6)
+
+sum(est_kgrbLMM[,1:6] != 0)/(n_iter * 6)
+
+
+sum(est_grbLMM[,7:106] != 0)/(n_iter * 100)
+
+sum(est_agrbLMM[,7:106] != 0)/(n_iter * 100)
+
+sum(est_kgrbLMM[,7:106] != 0)/(n_iter * 100)
+
+
+# The Mean squared predictions errors in Table 7 can be calculated by:
+
+mean(est_lme[,114]/est_grbLMM[,115])
+
+mean(est_grbLMM[,115]/est_grbLMM[,116])
+
+mean(est_agrbLMM[,115]/est_agrbLMM[,116])
+
+mean(est_kgrbLMM[,115]/est_kgrbLMM[,116])
+
+
+# The mean stopping iteration numbers in Table 7 can be calculated by:
+
+mean(est_grbLMM[,114])
+
+mean(est_agrbLMM[,114])
+
+mean(est_kgrbLMM[,114])
+
+
+
+
+# Main Loop ---------------------------------------------------------------
+
+
+for(iter in 1:n_iter){
+  
+  N <-  500 
+  
+  no_nj <- 5
+  
+  if(imbalanced){
+    
+    nj <- sample(1:no_nj, N, TRUE)
+    
+  }else{
+    
+    nj <- rep(no_nj, N)
+    
+  }
+  
+  no_vec[iter] <- sum(nj)
+  
+  
+  
+  if(incl_ran_sl){
+
+    tau2 <- tau2
+    
+    sigma2 <- sigma2
+    
+    varU1j <- varU1j
+      
+    covU0jU1j <- covU0jU1j
+      
+    (Tau.mtx <- matrix(c(tau2, covU0jU1j, covU0jU1j, varU1j),nrow=2,ncol=2) )
+    
+    w <- chol(Tau.mtx)
+    
+  }else{
+    
+    w <- matrix(tau2, 1, 1)
+    
+  }
+  
+  index <- 1
+  
+  
+  long_data_temp <- matrix(NA, nrow = sum(nj), ncol = 5 + incl_ran_sl +
+                         sum(c(coef_fixed_I, coef_fixed_II, coef_fixed_III, coef_fixed_IV, coef_fixed_V) != 0))
+  
+  {
+    Sim1 <- rcorrvar(n = 500, k_cat = 1, k_cont = 1, method = "Polynomial",
+                     means = 0, vars = 1, skews = 0, skurts = 0, fifths = 0, sixths = 0,
+                     marginal = list(c(1/2)), support = list(0:2),
+                     rho = matrix(c(1, 0.7, 0.7, 1), 2, 2), seed = iter + start_value - 1)  
+    
+    
+    cova <- matrix(0.7, 3, 3) 
+    
+    diag(cova) <- 1
+    
+    
+    Sim2 <- rcorrvar(n = sum(nj), k_cat = 1, k_cont = 2, method = "Polynomial",
+                     means = c(0,0), vars = c(5,5), skews = c(0,0), skurts = c(0,0), 
+                     fifths = c(0,0), sixths = c(0,0),
+                     marginal = list(c(1/2)), support = list(0:2),
+                     rho = cova, seed = iter + start_value - 1)
+    
+  }
+  
+  
+  if(incl_ran_sl){
+    
+    mv_norm_values <- mvrnorm(n = N, mu = c(0,0), 
+                              Sigma = matrix(c(tau2, covU0jU1j,
+                                               covU0jU1j, varU1j), 2))
+    
+  }
+  
+  
+  # (Outer Loop) Sample the marco units
+  for(id_0 in (1:N)){
+    
+    if(incl_ran_sl){
+      
+      U0j <- mv_norm_values[id_0,1]
+      
+      
+    }else{
+      
+      U0j <- w[1,1] * rnorm(1)
+      
+    }
+    
+    if(incl_ran_sl){
+      
+      U1j <- mv_norm_values[id_0,2]
+      
+    }
+    
+    xi_1 <- Sim1$continuous_variables[id_0,1]
+    
+    zi_1 <- Sim1$ordinal_variables[id_0,1]
+    
+    # (Inner loop) Within a marco unit, take a sample of no_obs units;
+    
+    for (no_obs in (1:nj[id_0])){ 
+      
+      
+      xij_1 <- Sim2$continuous_variables[which(rep(1:500, nj) == id_0)[no_obs], 1]
+      
+      xij_2 <- Sim2$continuous_variables[which(rep(1:500, nj) == id_0)[no_obs], 2] 
+      
+      zij_1 <- Sim2$ordinal_variables[which(rep(1:500, nj) == id_0)[no_obs], 1] 
+      
+      if(anyNA(c(xij_1, xij_2, zij_1))){
+        
+        print(c(id_0, no_obs))
+        
+      }
+      
+      
+      Rij <- sqrt(sigma2) * rnorm(1)   
+      
+      # Computed response/outcome variable of the linear mixed model and save    
+      
+      
+      insert <- c(id_0, no_obs, U0j, Rij)
+      
+      yij <- U0j  +  Rij
+      
+      if(coef_intercept != 0){
+        
+        yij <- yij + coef_intercept
+        
+      }
+      
+      
+      if(coef_fixed_I != 0){
+        
+        if(incl_ran_sl){
+          
+          yij <- yij + coef_fixed_I * xij_1 + U1j * xij_1
+          
+          insert <- c(insert, U1j, xij_1)
+          
+          
+        }else{
+          
+          yij <- yij + coef_fixed_I * xij_1
+          
+          insert <- c(insert, xij_1)
+          
+        }
+        
+      }
+      
+      
+      if(coef_fixed_II != 0){
+        
+        yij <- yij + coef_fixed_II * xi_1
+        
+        insert <- c(insert, xi_1)
+        
+      }
+      
+      if(coef_fixed_III != 0){
+        
+        yij <- yij + coef_fixed_III * xij_2
+        
+        insert <- c(insert, xij_2)
+        
+      }
+      
+      if(coef_fixed_IV != 0){
+        
+        yij <- yij + coef_fixed_IV * zi_1
+        
+        insert <- c(insert, zi_1)
+        
+      }
+      
+      
+      if(coef_fixed_V != 0){
+        
+        yij <- yij + coef_fixed_V * zij_1
+        
+        insert <- c(insert, zij_1)
+        
+      }
+      
+      
+      insert <- c(insert, yij)
+      
+      
+      
+      # insert <- c(id,no_obs,yij,xi_1,xij_1,xij_2,xi_1,U0j,U1j,Rij)
+      
+      long_data_temp[index, ] <- insert
+      
+      
+      index <- index + 1
+      
+    }  # <--- end inner loop, go to next no_obs unit
+  } # <--- end outer loop, go to next id unit
+  
+  
+  long_data_temp <- as.data.frame(long_data_temp)
+  
+  
+  names(long_data_temp)[1:4] <- c("id","no_obs","U0j","Rij")
+  
+  
+  if(coef_fixed_I != 0){
+    
+    if(incl_ran_sl){
+      
+      names(long_data_temp)[5:6] <- c("U1j", "xij_1")
+      
+    }else{
+      
+      names(long_data_temp)[5] <- "xij_1"
+      
+    }
+    
+    
+    if(any(c(coef_fixed_II, coef_fixed_III, coef_fixed_IV, coef_fixed_V) != 0)){
+      
+      names(long_data_temp)[(6 + incl_ran_sl):(5 + incl_ran_sl + sum(c(coef_fixed_II, coef_fixed_III, coef_fixed_IV, coef_fixed_V) != 0))] <- 
+        
+        c("xi_1", "xij_2", "zi_1","zij_1")[c(coef_fixed_II, coef_fixed_III, coef_fixed_IV, coef_fixed_V) != 0]
+      
+      
+    }
+    
+    
+    
+  }else{
+    
+    if(any(c(coef_fixed_II, coef_fixed_III, coef_fixed_IV, coef_fixed_V) != 0)){
+      
+      names(long_data_temp)[5:(4 + sum(c(coef_fixed_II, coef_fixed_III, coef_fixed_IV, coef_fixed_V) != 0))] <- 
+        
+        c("xi_1", "xij_2", "zi_1","zij_1")[c(coef_fixed_II, coef_fixed_III, coef_fixed_IV, coef_fixed_V) != 0]
+      
+      
+    }
+    
+    
+  }
+  
+  
+  names(long_data_temp)[ncol(long_data_temp)] <- "yij"
+  
+  
+  
+  if(incl_con_unin){
+    
+    for(i in seq_len(no_con_unin)){
+      
+      assign(paste0("con_unin_", i), rep(rnorm(n = N, mean = 0, 
+                                               sd = 1), nj))
+      
+      long_data_temp <- cbind(long_data_temp, eval(parse(text = paste0("con_unin_", i))))
+      
+    }
+    
+    colnames(long_data_temp)[(ncol(long_data_temp)-(no_con_unin-1)):ncol(long_data_temp)] <- paste0("con_unin_", 1:no_con_unin)
+    
+  }
+  
+  if(incl_bin_unin){
+    
+    for(i in seq_len(no_bin_unin)){
+      
+      assign(paste0("bin_unin_", i), rep(sample(0:1, size = N, TRUE), nj))
+      
+      long_data_temp <- cbind(long_data_temp, eval(parse(text = paste0("bin_unin_", i))))
+      
+    }
+    
+    colnames(long_data_temp)[(ncol(long_data_temp)-(no_bin_unin-1)):ncol(long_data_temp)] <- paste0("bin_unin_", 1:no_bin_unin)
+    
+  }
+  
+  if(incl_td_con_unin){
+    
+    for(i in seq_len(no_td_con_unin)){
+      
+      sampl_con_values <- numeric(0)
+      
+      for(j in seq_len(N)){
+        
+        mean_j <- runif(n = 1, min = -1, max = 1)
+        
+        sampl_con_values <- c(sampl_con_values, rnorm(n = nj[j], mean = mean_j, sd = 1))
+        
+      }
+      assign(paste0("td_con_unin_", i), sampl_con_values)
+      
+      long_data_temp <- cbind(long_data_temp, eval(parse(text = paste0("td_con_unin_", i))))
+      
+    }
+    
+    colnames(long_data_temp)[(ncol(long_data_temp)-(no_td_con_unin-1)):ncol(long_data_temp)] <- paste0("td_con_unin_", 1:no_td_con_unin)
+    
+  }
+  
+  if(incl_td_bin_unin){
+    
+    for(i in seq_len(no_td_bin_unin)){
+      
+      sampl_bin_values <- numeric(0)
+      
+      for(j in seq_len(N)){
+        
+        prob_j <- runif(n = 1, min = 0, max = 1)
+        
+        sampl_bin_values <- c(sampl_bin_values, sample(0:1, size = nj[j], TRUE, prob = c(1-prob_j, prob_j)))
+        
+      }
+      assign(paste0("td_bin_unin_", i), sampl_bin_values)
+      
+      long_data_temp <- cbind(long_data_temp, eval(parse(text = paste0("td_bin_unin_", i))))
+      
+    }
+    
+    colnames(long_data_temp)[(ncol(long_data_temp)-(no_td_bin_unin-1)):ncol(long_data_temp)] <- paste0("td_bin_unin_", 1:no_td_bin_unin)
+    
+  }
+  
+  
+  long_data <- long_data_temp
+  
+  
+  
+  if(cv){
+    
+    if(incl_lists){
+      
+      data_list[[iter]] <- long_data
+      
+    }
+    
+    training_no <- sort(sample(1:500, size = 450, FALSE))
+    
+    test_no <- setdiff(1:500, training_no)
+    
+    
+    test_data <- long_data %>% 
+      filter(id %in% test_no)
+    
+    long_data <- long_data %>% 
+      filter(id %in% training_no)
+    
+  }
+  
+  if(iter_from <= iter & iter <= iter_to){
+    
+    
+    
+    if(coef_fixed_I != 0){
+      
+      long_data$xij_1 <- scale(long_data$xij_1, TRUE, FALSE)
+      
+    }
+    
+    if(coef_fixed_II != 0){
+      
+      long_data$xi_1 <- scale(long_data$xi_1, TRUE, FALSE)
+      
+    }
+    
+    if(coef_fixed_III != 0){
+      
+      long_data$xij_2 <- scale(long_data$xij_2, TRUE, FALSE)
+      
+    }
+    
+    
+    
+    
+    y <- long_data$yij
+    
+    if(cv){
+      
+      X_test <- data.frame(a = rep(0, nrow(test_data)))
+      
+      y_test <- test_data$yij
+      
+    }
+    
+    
+    X <- data.frame(a = rep(0, nrow(long_data)))
+    
+    if(coef_fixed_I != 0){
+      
+      X$xij_1 <- long_data$xij_1
+      
+      if(cv){
+        
+        X_test$xij_1 <- test_data$xij_1
+        
+      }
+      
+    }
+    
+    if(coef_fixed_II != 0){
+      
+      X$xi_1 <- long_data$xi_1
+      
+      if(cv){
+        
+        X_test$xi_1 <- test_data$xi_1
+        
+      }
+    }
+    
+    if(coef_fixed_III != 0){
+      
+      X$xij_2 <- long_data$xij_2
+      
+      if(cv){
+        
+        X_test$xij_2 <- test_data$xij_2
+        
+      }
+      
+    }
+    
+    if(coef_fixed_IV != 0){
+      
+      X$zi_1 <- long_data$zi_1
+      
+      if(cv){
+        
+        X_test$zi_1 <- test_data$zi_1
+        
+      }
+      
+    }
+    
+    if(coef_fixed_V != 0){
+      
+      X$zij_1 <- long_data$zij_1
+      
+      if(cv){
+        
+        X_test$zij_1 <- test_data$zij_1
+        
+      }
+      
+    }
+    
+    
+    if((incl_con_unin | incl_bin_unin | incl_td_bin_unin | incl_td_con_unin)){
+      
+      X <- cbind(X, long_data %>%
+                   dplyr::select(contains("unin")))
+      
+    }
+    
+    if(cv){
+      
+      X_test <- cbind(X_test, test_data %>%
+                        dplyr::select(contains("unin")))
+      
+    }
+    
+    
+    
+    
+    X <- X[,-1]
+    
+    X <- as.matrix(X)
+    
+    if(cv){
+      
+      X_test <- X_test[,-1]
+      
+      X_test <- as.matrix(X_test)
+      
+    }
+    
+    
+    if(incl_ran_sl){
+      
+      Z <- cbind(1, long_data$xij_1)
+      
+      if(cv){
+        
+        Z_test <- cbind(1, test_data$xij_1)
+        
+      }
+      
+    }else{
+      
+      Z <- matrix(1, nrow = nrow(long_data), ncol = 1)
+      
+      if(cv){
+        
+        Z_test <- matrix(1, nrow = nrow(test_data), ncol = 1)
+        
+      }
+      
+    }
+    
+    id <- long_data$id
+    
+    if(cv){
+      
+      id_test <- test_data$id
+      
+    }
+    
+    ny <- 0.1
+    
+    cv.dat <- NULL
+    
+    aic <- FALSE
+    
+    ny <- 0.1
+    
+
+    if(fit_lme){
+      
+      my_formula <- "yij ~ "
+      
+      
+      if(coef_fixed_I != 0){
+        
+        my_formula <- paste0(my_formula, "xij_1")
+        
+      }
+      
+      if(coef_fixed_II != 0){
+        
+        my_formula <- paste(my_formula, "xi_1", sep = " + ")
+        
+      }
+      
+      
+      if(coef_fixed_III != 0){
+        
+        my_formula <- paste(my_formula, "xij_2", sep = " + ")
+        
+      }
+      
+      if(coef_fixed_IV != 0){
+        
+        my_formula <- paste(my_formula, "zi_1", sep = " + ")
+        
+      }
+      
+      if(coef_fixed_V != 0){
+        
+        my_formula <- paste(my_formula, "zij_1", sep = " + ")
+        
+      }
+      
+      if(incl_con_unin){
+        
+        my_formula <- paste(my_formula, "+",  paste(paste0("con_unin_", 1:no_con_unin), collapse = " + "))
+        
+      }
+      
+      if(incl_bin_unin){
+        
+        my_formula <- paste(my_formula, "+",  paste(paste0("bin_unin_", 1:no_bin_unin), collapse = " + "))
+        
+      }
+      
+      if(incl_td_con_unin){
+        
+        my_formula <- paste(my_formula, "+",  paste(paste0("td_con_unin_", 1:no_td_con_unin), collapse = " + "))
+        
+      }
+      
+      if(incl_td_bin_unin){
+        
+        my_formula <- paste(my_formula, "+",  paste(paste0("td_bin_unin_", 1:no_td_bin_unin), collapse = " + "))
+        
+      }
+      
+      if(incl_ran_sl){
+        
+        ran_formula <- "+ (1 + xij_1 |id)"
+        
+      }else{
+        
+        ran_formula <- "~ 1|id"
+        
+      }
+      
+      my_lme <- lmer(formula = as.formula(paste(my_formula, ran_formula)),
+                     data = long_data, REML = TRUE)
+      
+      covar_lme <- unname(bdiag(VarCorr(my_lme)))
+      
+      
+      if(cv){
+        
+        lme_rss <- sum((y_test - fixef(my_lme)[1] - X_test%*%fixef(my_lme)[-1])^2)
+        
+        
+        if(incl_ran_sl){
+          
+          est_lme[iter,] <- c(fixef(my_lme), sigma(my_lme)^2, 
+                              covar_lme[1], var((ranef(my_lme)$id)[,1]), 
+                              covar_lme[4], var((ranef(my_lme)$id)[,2]),
+                              covar_lme[2], cov((ranef(my_lme)$id)[,1], (ranef(my_lme)$id)[,2]),
+                              lme_rss, nrow(test_data))
+          
+        }else{
+          
+          est_lme[iter,] <- c(fixef(my_lme), sigma(my_lme)^2, 
+                              covar_lme[1], var((ranef(my_lme))[,1]), lme_rss, nrow(test_data))
+          
+          
+        }
+        
+      }else{
+        
+        if(incl_ran_sl){
+          
+          est_lme[iter,] <- c(fixef(my_lme), sigma(my_lme)^2, 
+                              covar_lme[1], var((ranef(my_lme)$id)[,1]), 
+                              covar_lme[4], var((ranef(my_lme)$id)[,2]),
+                              covar_lme[2], cov((ranef(my_lme)$id)[,1], (ranef(my_lme)$id)[,2]))
+          
+          
+        }else{
+          
+          est_lme[iter,] <- c(fixef(my_lme), sigma(my_lme)^2, 
+                              covar_lme[1], var((ranef(my_lme))[,1]))
+          
+        }
+        
+      }
+    }
+    
+
+    if(!cv){
+      
+      if(run_grbLMM){
+        
+        system.time(
+          
+          grbLMM_temp <- grbLMM(y = y, X = X, Z = Z, id = id, m.stop = m.stop_grbLMM, grbLMM_star = grbLMM_star,
+                           ny2 = ny2)
+        )
+      }
+      
+      if(run_agrbLMM){
+        
+        system.time(
+          
+          agrbLMM_temp <- agrbLMM(y = y, X = X, Z = Z, id = id, m.stop = m.stop_agrbLMM)
+          
+        )
+        
+      }
+      
+      if(run_kgrbLMM){
+        
+        system.time(
+          
+          kgrbLMM_temp <- kgrbLMM(y = y, X = X, Z = Z, id = id, m.stop = m.stop_kgrbLMM)
+          
+        )
+        
+      }
+      
+      
+    }else{
+      
+      if(run_grbLMM){
+        
+        grbLMM_temp <- cv.grbLMM(y = y, X = X, Z = Z, id = id, m.stop = m.stop_grbLMM, 
+                            which_model = "grbLMM", k = k, ny2 = ny2)
+        
+        grbLMM_rss <- sum((y_test - grbLMM_temp$int - X_test%*%grbLMM_temp$beta)^2)
+        
+      }
+      
+      if(run_agrbLMM){
+        
+        agrbLMM_temp <- cv.grbLMM(y = y, X = X, Z = Z, id = id, m.stop = m.stop_agrbLMM, 
+                             which_model = "agrbLMM", k = k)
+        
+        agrbLMM_rss <-  sum((y_test - agrbLMM_temp$int - X_test%*%agrbLMM_temp $beta)^2)
+        
+      }
+      
+      
+      if(run_kgrbLMM){
+        
+        kgrbLMM_temp  <- cv.grbLMM(y = y, X = X, Z = Z, id = id, m.stop = m.stop_kgrbLMM, 
+                             which_model = "kgrbLMM", k = k)
+        
+        kgrbLMM_rss <-  sum((y_test - kgrbLMM_temp$int - X_test%*%kgrbLMM_temp $beta)^2)
+        
+      }
+      
+    }
+    
+    
+    if(!cv){
+      
+      
+      if(run_grbLMM){
+        
+        if(incl_ran_sl){
+          
+          est_grbLMM[iter,] <- 
+            
+            c(grbLMM_temp$int, grbLMM_temp$beta, grbLMM_temp$sigma2, 
+              grbLMM_temp$Q[1], var(grbLMM_temp$gamma[seq(1, 2*length(unique(id))-1, by = 2)]),
+              grbLMM_temp$Q[4], var(grbLMM_temp$gamma[seq(2, 2*length(unique(id)), by = 2)]),
+              grbLMM_temp$Q[2], cov(grbLMM_temp$gamma[seq(1, 2*length(unique(id))-1, by = 2)],
+                               grbLMM_temp$gamma[seq(2, 2*length(unique(id)), by = 2)]))
+          
+        }else{
+          
+          est_grbLMM[iter,] <- 
+            
+            c(grbLMM_temp$int, grbLMM_temp$beta, grbLMM_temp$sigma2, grbLMM_temp$Q[1],
+              var(grbLMM_temp$gamma))
+          
+        }
+        
+      }
+      
+      if(run_agrbLMM){
+        
+        if(incl_ran_sl){
+          
+          est_agrbLMM[iter,] <- 
+            
+            
+            c(agrbLMM_temp$int, agrbLMM_temp$beta, agrbLMM_temp$sigma2,
+              agrbLMM_temp$VAR_BLUP[[length(agrbLMM_temp$INT)-1]][1], var(agrbLMM_temp$gamma[seq(1, 2*length(unique(id))-1, by = 2)]),
+              agrbLMM_temp$VAR_BLUP[[length(agrbLMM_temp$INT)-1]][4], var(agrbLMM_temp$gamma[seq(2, 2*length(unique(id)), by = 2)]),
+              agrbLMM_temp$VAR_BLUP[[length(agrbLMM_temp$INT)-1]][2], cov(agrbLMM_temp$gamma[seq(1, 2*length(unique(id))-1, by = 2)],
+                                                                agrbLMM_temp$gamma[seq(2, 2*length(unique(id)), by = 2)]))
+          
+        }else{
+          
+          est_agrbLMM[iter,] <- 
+            
+            c(agrbLMM_temp$int, agrbLMM_temp$beta, agrbLMM_temp$sigma2, 
+              agrbLMM_temp$VAR_BLUP[[length(agrbLMM_temp$INT)-1]][1], var(agrbLMM_temp$gamma))
+          
+        }
+        
+      }
+      
+      if(run_kgrbLMM){
+        
+        if(incl_ran_sl){
+          
+          est_kgrbLMM[iter,] <- 
+            
+            
+            c(kgrbLMM_temp$int, kgrbLMM_temp$beta, kgrbLMM_temp$sigma2,
+              kgrbLMM_temp$VAR_BLUP[[length(kgrbLMM_temp$INT)-1]][1], var(kgrbLMM_temp$gamma[seq(1, 2*length(unique(id))-1, by = 2)]),
+              kgrbLMM_temp$VAR_BLUP[[length(kgrbLMM_temp$INT)-1]][4], var(kgrbLMM_temp$gamma[seq(2, 2*length(unique(id)), by = 2)]),
+              kgrbLMM_temp$VAR_BLUP[[length(kgrbLMM_temp$INT)-1]][2], cov(kgrbLMM_temp$gamma[seq(1, 2*length(unique(id))-1, by = 2)],
+                                                                kgrbLMM_temp$gamma[seq(2, 2*length(unique(id)), by = 2)]))
+          
+        }else{
+          
+          est_kgrbLMM[iter,] <- 
+            
+            c(kgrbLMM_temp$int, kgrbLMM_temp$beta, kgrbLMM_temp$sigma2, 
+              kgrbLMM_temp$VAR_BLUP[[length(kgrbLMM_temp$INT)-1]][1], var(kgrbLMM_temp$gamma))
+          
+        }
+        
+      }
+      
+      
+      
+    }else{
+      
+      if(run_grbLMM){
+        
+        
+        if(incl_ran_sl){
+          
+          est_grbLMM[iter,] <- 
+            
+            c(grbLMM_temp$int, grbLMM_temp$beta, grbLMM_temp$sigma2, 
+              grbLMM_temp$Q[1], var(grbLMM_temp$gamma[seq(1, 2*length(unique(id))-1, by = 2)]),
+              grbLMM_temp$Q[4], var(grbLMM_temp$gamma[seq(2, 2*length(unique(id)), by = 2)]),
+              grbLMM_temp$Q[2], cov(grbLMM_temp$gamma[seq(1, 2*length(unique(id))-1, by = 2)],
+                               grbLMM_temp$gamma[seq(2, 2*length(unique(id)), by = 2)]),
+              grbLMM_temp$m.opt, grbLMM_rss, nrow(test_data))
+          
+          
+          
+        }else{
+          
+          est_grbLMM[iter,] <- 
+            
+            c(grbLMM_temp$coef, grbLMM_temp$sigma2, grbLMM_temp$Q[1], var(grbLMM_temp$gamma),
+              grbLMM_temp$m.opt,grbLMM_rss, nrow(test_data))
+          
+        }
+        
+      }
+      
+      if(run_agrbLMM){
+        
+        if(incl_ran_sl){
+          
+          est_agrbLMM[iter,] <- 
+            
+            c(agrbLMM_temp$int, agrbLMM_temp$beta, agrbLMM_temp$sigma2,
+              agrbLMM_temp$VAR_BLUP[[length(agrbLMM_temp$INT)-1]][1], var(agrbLMM_temp$gamma[seq(1, 2*length(unique(id))-1, by = 2)]),
+              agrbLMM_temp$VAR_BLUP[[length(agrbLMM_temp$INT)-1]][4], var(agrbLMM_temp$gamma[seq(2, 2*length(unique(id)), by = 2)]),
+              agrbLMM_temp$VAR_BLUP[[length(agrbLMM_temp$INT)-1]][2], cov(agrbLMM_temp$gamma[seq(1, 2*length(unique(id))-1, by = 2)],
+                                                                agrbLMM_temp$gamma[seq(2, 2*length(unique(id)), by = 2)]),
+              agrbLMM_temp$m.opt, agrbLMM_rss, nrow(test_data))
+          
+        }else{
+          
+          est_agrbLMM[iter,] <- 
+            
+            c(agrbLMM_temp$int, agrbLMM_temp$beta, agrbLMM_temp$sigma2, 
+              agrbLMM_temp$VAR_BLUP[[length(agrbLMM_temp$INT)-1]][1], var(agrbLMM_temp$gamma), agrbLMM_temp$m.opt,
+              agrbLMM_rss, nrow(test_data))
+          
+        }
+        
+        
+      }
+      
+      
+      if(run_kgrbLMM){
+        
+        if(incl_ran_sl){
+          
+          est_kgrbLMM[iter,] <- 
+            
+            c(kgrbLMM_temp$int, kgrbLMM_temp$beta, kgrbLMM_temp$sigma2,
+              kgrbLMM_temp$VAR_BLUP[[length(kgrbLMM_temp$INT)-1]][1], var(kgrbLMM_temp$gamma[seq(1, 2*length(unique(id))-1, by = 2)]),
+              kgrbLMM_temp$VAR_BLUP[[length(kgrbLMM_temp$INT)-1]][4], var(kgrbLMM_temp$gamma[seq(2, 2*length(unique(id)), by = 2)]),
+              kgrbLMM_temp$VAR_BLUP[[length(kgrbLMM_temp$INT)-1]][2], cov(kgrbLMM_temp$gamma[seq(1, 2*length(unique(id))-1, by = 2)],
+                                                                kgrbLMM_temp$gamma[seq(2, 2*length(unique(id)), by = 2)]),
+              kgrbLMM_temp$m.opt, kgrbLMM_rss, nrow(test_data))
+          
+        }else{
+          
+          est_kgrbLMM[iter,] <- 
+            
+            c(kgrbLMM_temp$int, kgrbLMM_temp$beta, kgrbLMM_temp$sigma2, 
+              kgrbLMM_temp$VAR_BLUP[[length(kgrbLMM_temp$INT)-1]][1], var(kgrbLMM_temp$gamma), kgrbLMM_temp$m.opt,
+              kgrbLMM_rss, nrow(test_data))
+          
+        }
+        
+        
+      }
+      
+    }
+    
+    
+    if(incl_lists){
+      
+      if(run_grbLMM){
+        
+        grbLMM_list[[iter]] <- list(grbLMM_temp$INT, grbLMM_temp$BETA,  
+                                    grbLMM_temp$SIGMA2,grbLMM_temp$VAR_BLUP)
+        
+        
+      }
+      
+      
+      
+      if(run_agrbLMM){
+        
+        agrbLMM_list[[iter]] <- list(agrbLMM_temp$INT, agrbLMM_temp$BETA,
+                                     agrbLMM_temp$SIGMA2,agrbLMM_temp$VAR_BLUP)
+        
+      }
+      
+      if(run_kgrbLMM){
+        
+        kgrbLMM_list[[iter]] <- list(kgrbLMM_temp$INT, kgrbLMM_temp$BETA,  
+                                     kgrbLMM_temp$SIGMA2,kgrbLMM_temp$VAR_BLUP)
+        
+      }  
+      
+    }
+    
+  }
+  
+  print(iter)
+  
+  
+}
+
+
